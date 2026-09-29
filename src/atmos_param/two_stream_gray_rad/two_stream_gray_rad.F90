@@ -28,7 +28,7 @@ module two_stream_gray_rad_mod
                                     mpp_pe, close_file, error_mesg, &
                                     NOTE, FATAL,  uppercase
 
-   use constants_mod,         only: stefan, cp_air, grav, pstd_mks, pstd_mks_earth, seconds_per_sol, orbital_period, radius
+   use constants_mod,         only: stefan, cp_air, grav, pstd_mks, pstd_mks_earth, seconds_per_sol, orbital_period, radius, rdgas
 
    use    diag_manager_mod,   only: register_diag_field, send_data
 
@@ -59,6 +59,72 @@ character(len=128) :: tag='Two-stream gray atmosphere'
 !   - reference: Ruth Geen etal, GRL 2016 (supp. information).
 !   - Set `wv_exponent` and `solar_exponent` to -1 in namelist to activate.
 !   - Moisture and CO2 feedback on SW and LW controlled by `ir_tau...` constants.
+!
+! Generic condensate cloud scheme (single species, grey)
+!   The default condensation curve is MgSiO3 (Roman & Rauscher 2019, ApJ 872, 1).
+!   Set the cld_* namelist values to model a different cloud species.
+!
+!   Condensation curve:
+!   - set `do_cld_condensation` to .true. to activate.
+!   - condensation temperature from the general log-linear form
+!         log10(P_bar) * cld_p_coeff = cld_A - cld_B/T - cld_mh_coeff * log10(cld_mh)
+!     =>  Tcond = cld_B / (cld_A - cld_p_coeff*log10(P_bar) - cld_mh_coeff*log10(cld_mh))
+!     Defaults (cld_A = 13.43, cld_B = 28665, cld_p_coeff = cld_mh_coeff = 1)
+!     give the MgSiO3 curve. Fits of the form
+!         1e4/Tcond = a - b*log10(P_bar) - c*[M/H]
+!     map onto this with cld_B = 1e4, cld_A = a, cld_p_coeff = b, cld_mh_coeff = c.
+!   - `cld_mh` is the non-log metallicity relative to solar (1 = solar, 10 = 10x solar).
+!   - `cld_species` is a label only, used in log messages and diagnostic long names.
+!   - outputs cld_tcond (K), cld_cond_flag (1 where T < Tcond, 0 elsewhere) and
+!     cld_flag (the cloud actually seen by the radiation, after the
+!     vertical-extent limit below).
+!
+!   Cloud vertical extent:
+!   - `cld_extent` = 'none' (default), 'thick' or 'thin'. Cloud base is the
+!     deepest (highest-pressure) level in a column with T < Tcond.
+!       'none'  : every cell with T < Tcond is cloudy.
+!       'thick' : cloud from the base up to `cld_thick_ptop` (Pa, default
+!                 100 Pa = 1 mbar).
+!       'thin'  : cloud from the base up `cld_thin_nscale` pressure scale
+!                 heights (default 1), i.e. up to p_base*exp(-cld_thin_nscale).
+!     Cells between the base and the limit are cloudy only where T < Tcond.
+!     The limit is applied to cld_flag, so it affects the TOA albedo and the
+!     LW and SW opacities. Outputs cld_p_cbase and cld_p_ctop (Pa, 0 if cloud-free).
+!
+!   Cloud-dependent TOA albedo:
+!   - set `do_cld_toa_albedo` to .true. to set TOA albedo = `cld_toa_albedo`
+!     (default 0.6) in any column with at least one cloudy level (cld_flag).
+!     Requires do_cld_condensation = .true. Outputs cld_toa_albedo.
+!
+!   Cloud optical depth (Roman & Rauscher 2019, ApJ 872, 1, Eqs. 1-2):
+!   - per cloudy cell (cld_flag), mass of condensible gas and optical depth
+!         m_g   = (dP/g) * cld_x_gas * (cld_mu_gas / mu_atm)
+!         tau   = 3 * m_g * Q * cld_f_cond / (4 * cld_r_part * cld_rho_part)
+!     with Q = cld_Q_lw_eff (longwave) or cld_Q_sw_eff (shortwave).
+!     User inputs: cld_x_gas (mole fraction of the condensible gas), cld_mu_gas
+!     (its molecular weight, g/mol), cld_Q_lw_eff, cld_Q_sw_eff, cld_f_cond,
+!     cld_r_part, cld_rho_part. mu_atm is derived from the model's specific
+!     gas constant (mu_atm = universal_gas_const / rdgas), so it matches
+!     whatever working fluid this experiment's constants_nml has set.
+!     Outputs cld_mgas (kg/m2) when either opacity is active.
+!
+!   Cloud longwave opacity:
+!   - set `do_cld_lw_opacity` to .true. to add tau_lw_cloud to cloudy cells,
+!     so tau_lw = tau_lw_atm + tau_lw_cloud there. Requires
+!     do_cld_condensation = .true., rad_scheme = "frierson", and
+!     do_normal_integration_method = .true. Outputs cld_tau_lw.
+!
+!   Cloud shortwave opacity:
+!   - set `do_cld_sw_opacity` to .true. to add tau_sw_cloud to cloudy cells,
+!     so tau_sw = tau_sw_atm + tau_sw_cloud. Because the Frierson SW stream
+!     is computed from the cumulative optical depth at half levels
+!     (sw_down = (1-A_toa) * S * exp(-sw_tau)), the per-layer cloud optical
+!     depth is summed downward from the model top and added to sw_tau.
+!     The grey SW stream is pure attenuation (no scattering), so cloud SW
+!     extinction is deposited as heating in the cloudy layers; reflection by
+!     the cloud is represented only by do_cld_toa_albedo. Requires
+!     do_cld_condensation = .true. and rad_scheme = "frierson" or "byrne".
+!     Outputs cld_tau_sw.
 !==================================================================================
 
 ! public interfaces
@@ -91,6 +157,57 @@ logical :: do_closein = .false.
 logical :: do_normal_integration_method = .true. 
 real :: R_stellar = 476700000. 
 real :: d_stellar = 1117512000.0
+
+! ---------------------------------------------------------------------------------
+! Generic condensate cloud scheme (default condensation curve = MgSiO3, R&R 2019)
+! ---------------------------------------------------------------------------------
+character(len=32) :: cld_species = 'MgSiO3'  ! label only (log messages, diag long names)
+
+! condensation curve: Tcond = cld_B / (cld_A - cld_p_coeff*log10(P_bar) - cld_mh_coeff*log10(cld_mh))
+logical :: do_cld_condensation = .false.
+real    :: cld_mh       = 100.0      ! non-log metallicity relative to solar (1 = solar, 10 = 10x solar)
+real    :: cld_A        = 13.43    ! intercept (MgSiO3)
+real    :: cld_B        = 28665.0  ! slope in 1/T, K (MgSiO3)
+real    :: cld_p_coeff  = 1.0      ! coefficient on log10(P_bar)
+real    :: cld_mh_coeff = 1.0      ! coefficient on log10(cld_mh)
+real, parameter :: pa_per_bar = 1.0e5
+
+! cloud vertical extent (applied to cld_flag, so it limits the TOA albedo
+! and the LW and SW opacities)
+!   'none'  : every cell with T < Tcond is cloudy
+!   'thick' : from the deepest T < Tcond level up to cld_thick_ptop
+!   'thin'  : from the deepest T < Tcond level up cld_thin_nscale pressure
+!             scale heights, i.e. to p_base * exp(-cld_thin_nscale)
+character(len=16) :: cld_extent = 'none'
+real    :: cld_thick_ptop  = 100.0   ! Pa (1 mbar), cloud top for 'thick'
+real    :: cld_thin_nscale = 1.0     ! scale heights above cloud base for 'thin'
+integer, parameter :: CLD_EXT_NONE = 0, CLD_EXT_THICK = 1, CLD_EXT_THIN = 2
+integer :: cld_ext = CLD_EXT_NONE
+
+! cloud-dependent TOA albedo
+logical :: do_cld_toa_albedo = .false.
+real    :: cld_toa_albedo    = 0.6   ! TOA albedo in columns with any cloudy level
+
+! cloud optical depth (Roman & Rauscher 2019, ApJ 872, 1, eqs. 1-2)
+logical :: do_cld_lw_opacity = .false.
+logical :: do_cld_sw_opacity = .false.
+real    :: cld_x_gas    = 0.0     ! mole fraction of the condensible gas (chi_g)
+real    :: cld_mu_gas   = 100.39  ! molecular weight of the condensible species, g/mol (MgSiO3)
+real    :: cld_Q_lw_eff = 0.01    ! particle extinction efficiency, longwave (Q_e,LW)
+real    :: cld_Q_sw_eff = 0.01    ! particle extinction efficiency, shortwave (Q_e,SW)
+real    :: cld_f_cond   = 0.1     ! fraction of the condensible gas that forms condensate
+real    :: cld_r_part   = 0.2e-6  ! particle radius, m
+real    :: cld_rho_part = 3200.0  ! particle density, kg/m^3 (MgSiO3, R&R 2019 Table 2)
+
+! universal gas constant, J/(kmol K); mean atmospheric molecular weight is
+! derived from this and the model's specific gas constant (rdgas), so it is
+! consistent with whatever this experiment's constants_nml has set.
+real, parameter :: universal_gas_const = 8314.4621
+
+real, allocatable, dimension(:,:,:) :: tcond_cld, cld_flag, cld_cond_flag
+real, allocatable, dimension(:,:,:) :: mgas_cld, tau_lw_cld, tau_sw_cld
+real, allocatable, dimension(:,:)   :: p_cbase_cld, p_ctop_cld   ! Pa, 0 if cloud-free
+real, allocatable, dimension(:,:)   :: toa_albedo
 
 character(len=32) :: rad_scheme = 'frierson'
 
@@ -157,13 +274,21 @@ namelist /two_stream_gray_rad_nml/ solar_constant, del_sol, &
            do_read_co2, co2_file, co2_variable_name, solday, equinox_day, bog_a, bog_b, bog_mu, &
            use_time_average_coszen, dt_rad_avg, &
            diabatic_acce, &
-           do_toa_albedo, do_tl, do_closein, R_stellar, d_stellar, do_normal_integration_method
+           do_toa_albedo, do_tl, do_closein, R_stellar, d_stellar, do_normal_integration_method, &
+           cld_species, &
+           do_cld_condensation, cld_mh, cld_A, cld_B, cld_p_coeff, cld_mh_coeff, &
+           cld_extent, cld_thick_ptop, cld_thin_nscale, &
+           do_cld_toa_albedo, cld_toa_albedo, &
+           do_cld_lw_opacity, do_cld_sw_opacity, cld_x_gas, cld_mu_gas, &
+           cld_Q_lw_eff, cld_Q_sw_eff, cld_f_cond, cld_r_part, cld_rho_part
 !==================================================================================
 !-------------------- diagnostics fields -------------------------------
 
 integer :: id_olr, id_swdn_sfc, id_swdn_toa, id_net_lw_surf, id_lwdn_sfc, id_lwup_sfc, &
            id_tdt_rad, id_tdt_solar, id_flux_rad, id_flux_lw, id_flux_sw, id_coszen, id_fracsun, &
-           id_lw_dtrans, id_lw_dtrans_win, id_sw_dtrans, id_co2, id_nudge_flux, id_tau
+           id_lw_dtrans, id_lw_dtrans_win, id_sw_dtrans, id_co2, id_nudge_flux, id_tau, &
+           id_tcond_cld, id_cld_flag, id_toa_albedo, id_mgas_cld, id_tau_lw_cld, id_tau_sw_cld, &
+           id_cld_cond_flag, id_p_cbase_cld, id_p_ctop_cld
 
 character(len=10), parameter :: mod_name = 'two_stream'
 
@@ -188,6 +313,7 @@ real, intent(in)                  :: dt_real !s atmospheric timestep, used for r
 !-------------------------------------------------------------------------------------
 integer, dimension(3) :: half = (/1,2,4/)
 integer :: ierr, io, unit
+character(len=64) :: sp
 !-----------------------------------------------------------------------------------------
 ! read namelist and copy to logfile
 
@@ -210,9 +336,88 @@ pi         = 4. * atan(1.)
 deg_to_rad = pi/180.
 rad_to_deg = 180./pi
 
+sp = trim(cld_species)
+
 call astronomy_init
 
 if(dt_rad_avg .le. 0) dt_rad_avg = dt_real !s if dt_rad_avg is set to a value in nml then it will be used instead of dt_real
+
+if (do_cld_condensation) then
+  if (cld_mh <= 0.0) then
+    call error_mesg('two_stream_gray_rad','cld_mh must be positive (non-log metallicity).', FATAL)
+  endif
+  if (cld_B <= 0.0) then
+    call error_mesg('two_stream_gray_rad','cld_B must be positive.', FATAL)
+  endif
+  call error_mesg('two_stream_gray_rad','Condensate cloud scheme active for species: '//trim(sp), NOTE)
+endif
+
+! cloud vertical extent
+select case (uppercase(trim(cld_extent)))
+case ('NONE')
+  cld_ext = CLD_EXT_NONE
+case ('THICK')
+  cld_ext = CLD_EXT_THICK
+case ('THIN')
+  cld_ext = CLD_EXT_THIN
+case default
+  call error_mesg('two_stream_gray_rad','cld_extent must be "none", "thick" or "thin".', FATAL)
+end select
+if (cld_ext /= CLD_EXT_NONE .and. .not. do_cld_condensation) then
+  call error_mesg('two_stream_gray_rad','cld_extent /= "none" requires do_cld_condensation = .true.', FATAL)
+endif
+if (cld_thick_ptop <= 0.0 .or. cld_thin_nscale <= 0.0) then
+  call error_mesg('two_stream_gray_rad','cld_thick_ptop and cld_thin_nscale must be positive.', FATAL)
+endif
+if (do_cld_condensation) then
+  call error_mesg('two_stream_gray_rad','Cloud vertical extent: '//trim(cld_extent), NOTE)
+endif
+
+if (do_cld_toa_albedo .and. .not. do_cld_condensation) then
+  call error_mesg('two_stream_gray_rad','do_cld_toa_albedo requires do_cld_condensation = .true.', FATAL)
+endif
+if (cld_toa_albedo < 0.0 .or. cld_toa_albedo >= 1.0) then
+  call error_mesg('two_stream_gray_rad','cld_toa_albedo must be in [0,1).', FATAL)
+endif
+
+! cloud longwave opacity: scheme-specific requirements
+if (do_cld_lw_opacity) then
+  if (.not. do_cld_condensation) then
+    call error_mesg('two_stream_gray_rad','do_cld_lw_opacity requires do_cld_condensation = .true.', FATAL)
+  endif
+  if (uppercase(trim(rad_scheme)) /= 'FRIERSON') then
+    call error_mesg('two_stream_gray_rad','do_cld_lw_opacity is currently only implemented for rad_scheme = "frierson".', FATAL)
+  endif
+  if (.not. do_normal_integration_method) then
+    call error_mesg('two_stream_gray_rad','do_cld_lw_opacity currently requires do_normal_integration_method = .true.', FATAL)
+  endif
+endif
+
+! cloud shortwave opacity: scheme-specific requirements
+if (do_cld_sw_opacity) then
+  if (.not. do_cld_condensation) then
+    call error_mesg('two_stream_gray_rad','do_cld_sw_opacity requires do_cld_condensation = .true.', FATAL)
+  endif
+  if (uppercase(trim(rad_scheme)) /= 'FRIERSON' .and. uppercase(trim(rad_scheme)) /= 'BYRNE') then
+    call error_mesg('two_stream_gray_rad','do_cld_sw_opacity is currently only implemented for rad_scheme = "frierson" or "byrne".', FATAL)
+  endif
+endif
+
+! cloud optical depth: shared parameter checks
+if (do_cld_lw_opacity .or. do_cld_sw_opacity) then
+  if (cld_r_part <= 0.0 .or. cld_rho_part <= 0.0 .or. cld_mu_gas <= 0.0) then
+    call error_mesg('two_stream_gray_rad','cld_r_part, cld_rho_part, and cld_mu_gas must be positive.', FATAL)
+  endif
+  if (cld_Q_lw_eff < 0.0 .or. cld_Q_sw_eff < 0.0) then
+    call error_mesg('two_stream_gray_rad','cld_Q_lw_eff and cld_Q_sw_eff must be non-negative.', FATAL)
+  endif
+  if (cld_x_gas < 0.0 .or. cld_f_cond < 0.0 .or. cld_f_cond > 1.0) then
+    call error_mesg('two_stream_gray_rad','cld_x_gas must be non-negative and cld_f_cond must be in [0,1].', FATAL)
+  endif
+  if (rdgas <= 0.0) then
+    call error_mesg('two_stream_gray_rad','rdgas must be positive to derive the mean atmospheric molecular weight for the cloud opacity.', FATAL)
+  endif
+endif
 
 if(do_read_co2)then
    call interpolator_init (co2_interp, trim(co2_file)//'.nc', lonb, latb, data_out_of_bounds=(/ZERO/))
@@ -281,6 +486,26 @@ allocate (insolation       (ie-is+1, je-js+1))
 allocate (p2               (ie-is+1, je-js+1))
 allocate (coszen           (ie-is+1, je-js+1))
 allocate (fracsun          (ie-is+1, je-js+1)) !jp from astronomy.f90 : fraction of sun on surface
+
+if (do_cld_condensation) then
+  allocate (tcond_cld      (ie-is+1, je-js+1, num_levels))
+  allocate (cld_flag       (ie-is+1, je-js+1, num_levels))
+  allocate (cld_cond_flag  (ie-is+1, je-js+1, num_levels))
+  allocate (p_cbase_cld    (ie-is+1, je-js+1))
+  allocate (p_ctop_cld     (ie-is+1, je-js+1))
+endif
+
+if (do_cld_lw_opacity .or. do_cld_sw_opacity) then
+  allocate (mgas_cld    (ie-is+1, je-js+1, num_levels))
+endif
+if (do_cld_lw_opacity) then
+  allocate (tau_lw_cld  (ie-is+1, je-js+1, num_levels))
+endif
+if (do_cld_sw_opacity) then
+  allocate (tau_sw_cld  (ie-is+1, je-js+1, num_levels))
+endif
+
+allocate (toa_albedo (ie-is+1, je-js+1))
 
 !Allocate RG variables only if option selected.
 select case(lw_scheme)
@@ -398,6 +623,51 @@ end select
    register_diag_field ( mod_name, 'nudge_flux', axes(1:2), Time, &
                'Sea ice nudging flux', &
                'W/m2', missing_value=missing_value               )
+
+    id_tcond_cld = &
+    register_diag_field ( mod_name, 'cld_tcond', axes(1:3), Time, &
+               trim(sp)//' condensation temperature', &
+               'K', missing_value=missing_value               )
+
+    id_cld_cond_flag = &
+    register_diag_field ( mod_name, 'cld_cond_flag', axes(1:3), Time, &
+               trim(sp)//' condensation flag before vertical-extent limit (1 where T < Tcond)', &
+               'none', missing_value=missing_value            )
+
+    id_cld_flag = &
+    register_diag_field ( mod_name, 'cld_flag', axes(1:3), Time, &
+               trim(sp)//' cloud flag after vertical-extent limit (used by radiation)', &
+               'none', missing_value=missing_value            )
+
+    id_p_cbase_cld = &
+    register_diag_field ( mod_name, 'cld_p_cbase', axes(1:2), Time, &
+               trim(sp)//' cloud base pressure (0 if cloud-free)', &
+               'Pa', missing_value=missing_value              )
+
+    id_p_ctop_cld = &
+    register_diag_field ( mod_name, 'cld_p_ctop', axes(1:2), Time, &
+               trim(sp)//' cloud top pressure (0 if cloud-free)', &
+               'Pa', missing_value=missing_value              )
+
+    id_toa_albedo = &
+    register_diag_field ( mod_name, 'cld_toa_albedo', axes(1:2), Time, &
+               'TOA albedo applied to insolation', &
+               'none', missing_value=missing_value            )
+
+    id_mgas_cld = &
+    register_diag_field ( mod_name, 'cld_mgas', axes(1:3), Time, &
+               'Mass of condensible gas ('//trim(sp)//' cloud) per unit area in cloudy cells', &
+               'kg/m2', missing_value=missing_value            )
+
+    id_tau_lw_cld = &
+    register_diag_field ( mod_name, 'cld_tau_lw', axes(1:3), Time, &
+               trim(sp)//' cloud longwave optical depth added in cloudy cells', &
+               'none', missing_value=missing_value            )
+
+    id_tau_sw_cld = &
+    register_diag_field ( mod_name, 'cld_tau_sw', axes(1:3), Time, &
+               trim(sp)//' cloud shortwave optical depth added in cloudy cells (per layer)', &
+               'none', missing_value=missing_value            )
 return
 end subroutine two_stream_gray_rad_init
 
@@ -427,6 +697,8 @@ real :: ci_lat_f, ci_lat_d
 real, dimension(size(q,1), size(q,2)) :: ci_rho_dist, ci_J_f, ci_alpha, ci_beta, ci_phi, & 
                                          ci_t, ci_l, ci_s, ci_delta1, ci_delta2, ci_J_p
 
+! cumulative (TOA-downward) cloud SW optical depth
+real, dimension(size(q,1), size(q,2)) :: tau_sw_cld_cum
 
 real ,dimension(size(q,1),size(q,2),size(q,3)) :: co2f
 
@@ -542,6 +814,19 @@ else
   insolation = insolation 
 end if
 
+! =================================================================================
+! Condensate cloud flags (incl. vertical-extent limit), cloud optical depths and
+! cloud-dependent TOA albedo (must precede the SW calculation). cld_flag here is
+! already limited by cld_extent, so the albedo and the LW/SW opacities all see
+! the limited cloud.
+if (do_cld_condensation) call cld_condensation(p_half, t, Time_diag)
+if (do_cld_lw_opacity .or. do_cld_sw_opacity) call cld_opacity(p_half, Time_diag)
+
+toa_albedo = cloud_albedo   ! background value everywhere
+if (do_cld_toa_albedo) then
+  where (any(cld_flag > 0.5, dim=3)) toa_albedo = cld_toa_albedo
+endif
+
 select case(sw_scheme)
 case(B_GEEN)
   ! RG scheme: optical depth a function of wv and co2
@@ -573,10 +858,22 @@ case(B_FRIERSON, B_BYRNE)
     sw_tau(:,:,k) = sw_tau_0 * (p_half(:,:,k)/pstd_mks)**solar_exponent
   end do
 
+  ! add condensate cloud shortwave optical depth: tau_sw_total = tau_sw_atm + tau_sw_cloud.
+  ! sw_tau is cumulative from the model top at half levels, and half level k+1
+  ! is the bottom of layer k, so the per-layer cloud optical depth is summed
+  ! downward. tau_sw_cld is zero outside cloudy cells; sw_tau(:,:,1) (TOA) is unchanged.
+  if (do_cld_sw_opacity) then
+    tau_sw_cld_cum = 0.0
+    do k = 1, n
+      tau_sw_cld_cum   = tau_sw_cld_cum + tau_sw_cld(:,:,k)
+      sw_tau(:,:,k+1)  = sw_tau(:,:,k+1) + tau_sw_cld_cum
+    end do
+  endif
+
   ! compute downward shortwave flux
 
   do k = 1, n+1
-     sw_down(:,:,k)   = (1-cloud_albedo) * insolation(:,:) * exp(-sw_tau(:,:,k))
+     sw_down(:,:,k)   = (1.0 - toa_albedo(:,:)) * insolation(:,:) * exp(-sw_tau(:,:,k))
   end do
 
 case(B_SCHNEIDER_LIU)
@@ -683,6 +980,16 @@ case(B_FRIERSON)
      lw_dtrans(:,:,k) = exp( -(lw_tau(:,:,k+1) - lw_tau(:,:,k)) )
   end do
 
+  ! add condensate cloud longwave optical depth in cloudy cells: tau_total = tau_atm + tau_cloud,
+  ! i.e. lw_dtrans_total = lw_dtrans_atm * exp(-tau_cloud)
+  if (do_cld_lw_opacity) then
+    do k = 1, n
+      where (cld_flag(:,:,k) > 0.5)
+        lw_dtrans(:,:,k) = lw_dtrans(:,:,k) * exp( -tau_lw_cld(:,:,k) )
+      endwhere
+    end do
+  endif
+
   ! compute downward longwave flux by integrating downward
   lw_down(:,:,1)      = 0.
   if (do_normal_integration_method) then
@@ -767,6 +1074,11 @@ endif
 !------- carbon dioxide concentration ------------
 if ( id_co2 > 0 ) then
    used = send_data ( id_co2, carbon_conc, Time_diag)
+endif
+
+!------- TOA albedo applied to insolation ------------
+if ( id_toa_albedo > 0 ) then
+   used = send_data ( id_toa_albedo, toa_albedo, Time_diag)
 endif
 
 return
@@ -903,6 +1215,180 @@ end subroutine two_stream_gray_rad_up
 
 ! ==================================================================================
 
+subroutine cld_condensation(p_half, t, Time_diag)
+
+! 1) Computes the condensation temperature of the cloud species at each full
+!    level and flags cells where T < Tcond (cld_cond_flag), using
+!
+!      Tcond = cld_B / (cld_A - cld_p_coeff*log10(P_bar) - cld_mh_coeff*log10(cld_mh))
+!
+!    With the defaults (cld_A = 13.43, cld_B = 28665, cld_p_coeff = cld_mh_coeff = 1)
+!    this is the MgSiO3 curve  log10(P_bar) = 13.43 - 28665/T - log10(mh).
+!
+! 2) Applies the vertical-extent limit to give cld_flag, which is what the TOA
+!    albedo and LW/SW opacities use. Cloud base = deepest level with T < Tcond
+!    (k = 1 is the model top). Cells with full-level pressure below p_lim are
+!    cleared:
+!      'none' : p_lim = 0 (no ceiling)
+!      'thick': p_lim = cld_thick_ptop
+!      'thin' : p_lim = p_base * exp(-cld_thin_nscale)
+!    Cells between the base and p_lim are cloudy only where T < Tcond.
+
+real, intent(in), dimension(:,:,:) :: p_half, t
+type(time_type), intent(in)        :: Time_diag
+
+integer :: i, j, k, n, kbase, ktop
+real    :: log_mh, p_lim
+real, dimension(size(t,1), size(t,2))            :: p_bar, denom
+real, dimension(size(t,1), size(t,2), size(t,3)) :: p_full
+logical :: used
+
+n      = size(t,3)
+log_mh = log10(cld_mh)
+
+! ---- 1) raw condensation flag ----
+do k = 1, n
+  ! full-level pressure = mean of bounding half levels (Pa); converted to bar for Tcond
+  p_full(:,:,k) = 0.5 * (p_half(:,:,k) + p_half(:,:,k+1))
+  p_bar = p_full(:,:,k) / pa_per_bar
+  denom = cld_A - cld_p_coeff*log10(p_bar) - cld_mh_coeff*log_mh
+
+  if (any(denom <= 0.0)) then
+    call error_mesg('two_stream_gray_rad', &
+         trim(cld_species)//' condensation: pressure and metallicity give non-positive Tcond denominator.', FATAL)
+  endif
+
+  tcond_cld(:,:,k) = cld_B / denom
+
+  where (t(:,:,k) < tcond_cld(:,:,k))
+    cld_cond_flag(:,:,k) = 1.0
+  elsewhere
+    cld_cond_flag(:,:,k) = 0.0
+  endwhere
+end do
+
+! ---- 2) vertical extent ----
+cld_flag    = cld_cond_flag
+p_cbase_cld = 0.0
+p_ctop_cld  = 0.0
+
+do j = 1, size(t,2)
+  do i = 1, size(t,1)
+
+    ! cloud base: deepest (highest-pressure) condensing level
+    kbase = 0
+    do k = n, 1, -1
+      if (cld_cond_flag(i,j,k) > 0.5) then
+        kbase = k
+        exit
+      endif
+    end do
+    if (kbase == 0) cycle   ! no condensation in this column
+
+    select case (cld_ext)
+    case (CLD_EXT_THICK)
+      p_lim = cld_thick_ptop
+    case (CLD_EXT_THIN)
+      p_lim = p_full(i,j,kbase) * exp(-cld_thin_nscale)
+    case default
+      p_lim = 0.0             ! 'none': no ceiling
+    end select
+
+    where (p_full(i,j,:) < p_lim) cld_flag(i,j,:) = 0.0
+
+    ! effective cloud top after truncation
+    ktop = 0
+    do k = 1, kbase
+      if (cld_flag(i,j,k) > 0.5) then
+        ktop = k
+        exit
+      endif
+    end do
+    if (ktop == 0) cycle   ! e.g. 'thick' with base already above cld_thick_ptop
+
+    p_cbase_cld(i,j) = p_full(i,j,kbase)
+    p_ctop_cld(i,j)  = p_full(i,j,ktop)
+  end do
+end do
+
+if ( id_tcond_cld > 0 ) then
+   used = send_data ( id_tcond_cld, tcond_cld, Time_diag)
+endif
+if ( id_cld_cond_flag > 0 ) then
+   used = send_data ( id_cld_cond_flag, cld_cond_flag, Time_diag)
+endif
+if ( id_cld_flag > 0 ) then
+   used = send_data ( id_cld_flag, cld_flag, Time_diag)
+endif
+if ( id_p_cbase_cld > 0 ) then
+   used = send_data ( id_p_cbase_cld, p_cbase_cld, Time_diag)
+endif
+if ( id_p_ctop_cld > 0 ) then
+   used = send_data ( id_p_ctop_cld, p_ctop_cld, Time_diag)
+endif
+
+end subroutine cld_condensation
+
+! ==================================================================================
+
+subroutine cld_opacity(p_half, Time_diag)
+
+! Computes the condensate cloud optical depths added in cloudy cells
+! (cld_flag, i.e. T < Tcond and within the cld_extent limit), following
+! Roman & Rauscher (2019), ApJ 872, 1, Eqs. 1-2:
+!
+!   m_g   = (dP/g) * x_gas * (mu_gas / mu_atm)         [Eq. 1, mass of condensible
+!                                                       gas per unit area in the layer]
+!   tau_a = 3 * m_g * Q_eff * f / (4 * r * rho)        [Eq. 2, aerosol optical depth]
+!
+! evaluated separately for the longwave (Q_eff = cld_Q_lw_eff -> tau_lw_cld)
+! and the shortwave (Q_eff = cld_Q_sw_eff -> tau_sw_cld). Both are per-layer
+! optical depths at full levels.
+!
+! mu_gas (cld_mu_gas) is the condensible gas species and mu_atm is the bulk
+! atmosphere, derived from the model's own specific gas constant via
+! mu_atm = universal_gas_const / rdgas. mgas_cld (and hence both optical
+! depths) is zero in non-cloudy cells.
+
+real, intent(in), dimension(:,:,:) :: p_half
+type(time_type), intent(in)        :: Time_diag
+
+integer :: k, n
+real    :: mu_atm, geom_fac
+real, dimension(size(p_half,1), size(p_half,2)) :: delta_p
+logical :: used
+
+n        = size(p_half,3) - 1
+mu_atm   = universal_gas_const / rdgas   ! mean molecular weight of the bulk atmosphere
+geom_fac = 3.0 * cld_f_cond / (4.0 * cld_r_part * cld_rho_part)   ! m^2/kg per unit Q_eff
+
+do k = 1, n
+  delta_p = p_half(:,:,k+1) - p_half(:,:,k)
+
+  where (cld_flag(:,:,k) > 0.5)
+    mgas_cld(:,:,k) = (delta_p/grav) * cld_x_gas * (cld_mu_gas/mu_atm)
+  elsewhere
+    mgas_cld(:,:,k) = 0.0
+  endwhere
+end do
+
+if (do_cld_lw_opacity) tau_lw_cld = cld_Q_lw_eff * geom_fac * mgas_cld
+if (do_cld_sw_opacity) tau_sw_cld = cld_Q_sw_eff * geom_fac * mgas_cld
+
+if ( id_mgas_cld > 0 ) then
+   used = send_data ( id_mgas_cld, mgas_cld, Time_diag)
+endif
+if ( do_cld_lw_opacity .and. id_tau_lw_cld > 0 ) then
+   used = send_data ( id_tau_lw_cld, tau_lw_cld, Time_diag)
+endif
+if ( do_cld_sw_opacity .and. id_tau_sw_cld > 0 ) then
+   used = send_data ( id_tau_sw_cld, tau_sw_cld, Time_diag)
+endif
+
+end subroutine cld_opacity
+
+! ==================================================================================
+
 
 subroutine two_stream_gray_rad_end
 
@@ -925,6 +1411,13 @@ endif
 if(lw_scheme.eq.B_SCHNEIDER_LIU) then
 	deallocate (b_surf_gp)
 endif
+
+if (do_cld_condensation) deallocate (tcond_cld, cld_flag, cld_cond_flag, p_cbase_cld, p_ctop_cld)
+if (do_cld_lw_opacity .or. do_cld_sw_opacity) deallocate (mgas_cld)
+if (do_cld_lw_opacity) deallocate (tau_lw_cld)
+if (do_cld_sw_opacity) deallocate (tau_sw_cld)
+
+deallocate (toa_albedo)
 
 if(do_read_co2)call interpolator_end(co2_interp)
 

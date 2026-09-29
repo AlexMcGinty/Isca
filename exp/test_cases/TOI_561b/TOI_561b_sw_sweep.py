@@ -41,7 +41,13 @@ diag.add_field('mixed_layer', 'flux_t', time_avg=True)
 diag.add_field('mixed_layer', 't_surf', time_avg=True)
 diag.add_field('vert_turb', 'z_pbl', time_avg=True)
 diag.add_field('vert_turb', 'diff_t', time_avg=True)
-
+# condensate cloud diagnostics (generic cld_* names)
+diag.add_field('two_stream', 'cld_tcond', time_avg=True)
+diag.add_field('two_stream', 'cld_flag', time_avg=True)
+diag.add_field('two_stream', 'cld_toa_albedo', time_avg=True)
+diag.add_field('two_stream', 'cld_mgas', time_avg=True)
+diag.add_field('two_stream', 'cld_tau_lw', time_avg=True)
+diag.add_field('two_stream', 'cld_tau_sw', time_avg=True)
 # diag2 = DiagTable()
 # diag2.add_file('atmos_monthly', 30, 'days', time_units='days')
 
@@ -246,22 +252,47 @@ exp.namelist = namelist = Namelist({
 
 
     'two_stream_gray_rad_nml': {
-      'rad_scheme': 'frierson',            #Select radiation scheme to use
-        'do_seasonal': False,                #do_seasonal=false uses the p2 insolation profile
+        'rad_scheme': 'frierson',
+        'do_seasonal': False,
         'do_tl':True,
         'do_closein':True,
-        'atm_abs': 0.,#1.,#22,                      # default: 0.0  
+        'atm_abs': 0.,
         'solar_exponent':1,
-        'ir_tau_eq':1,#4.5, 
-        'ir_tau_pole':1,#1.5, 
+        'ir_tau_eq':1,
+        'ir_tau_pole':1,
         'del_sol':1.2, 
         'solar_constant':4715*1361, 
         'R_stellar':0.843*6.957e8,
         'd_stellar':0.01055*1.496e11,
-        'linear_tau':1.0,#0.2, 
+        'linear_tau':1.0,
         'odp':1.0,
-    },
 
+        # ---- condensate cloud scheme (generic cld_* inputs) ----
+        # cloud species: label and condensation curve
+        #   Tcond = cld_B / (cld_A - cld_p_coeff*log10(P_bar) - cld_mh_coeff*log10(cld_mh))
+        'cld_species' : 'MgSiO3',
+        'do_cld_condensation': True,
+        'cld_A' : 13.43,           # MgSiO3 (R&R 2019)
+        'cld_B' : 28665.0,         # MgSiO3 (R&R 2019)
+        'cld_mh' : 100.0,
+        # cloud-dependent TOA albedo
+        'do_cld_toa_albedo' : False,
+        'cld_toa_albedo' : 0.6,
+        # cloud longwave opacity (R&R 2019 Eqs. 1-2)
+        'do_cld_lw_opacity': True,
+        'do_cld_sw_opacity': True,
+        'cld_x_gas' : 1e-4,
+        'cld_mu_gas' : 100.8,
+        'cld_Q_lw_eff' : 0.01,
+        'cld_Q_sw_eff' : 2.76,
+        'cld_r_part' : 0.2e-6,
+        'cld_rho_part' : 3.2e3,
+        'cld_f_cond' : 0.01,
+        'cld_extent' : 'thick',
+        'cld_thick_ptop' : 100, #Pa
+        'cld_thin_nscale' : 1.0,
+
+    },
 
     'spectral_dynamics_nml': {
         'damping_order': 4, # DEFAULT: 2 
@@ -272,7 +303,7 @@ exp.namelist = namelist = Namelist({
         'reference_sea_level_press':10.0e5, # DEFAULT: 101325. 
                                            # used to construct hybrid coord and in implicit timestepping 
                                            # note actual mean sea level pressure is set in constants_mod 
-        'num_levels':30, # Number of levels corresponding to set below 
+        'num_levels':40, # Number of levels corresponding to set below 
         'valid_range_t':[1.,6000.], # just set this to be a wide temperature range 
         'initial_sphum':[0.], # DEFAULT: 0.0 
                                  # start the model with some water in atmosphere 
@@ -281,16 +312,16 @@ exp.namelist = namelist = Namelist({
                                      # I have a set of hybrid levels I like to use, input below 
         'robert_coeff':0.03, # DEFAULT: 0.04, used in Robert filter for timestepping 
         # set to T42 resolution (default)
-        'lon_max': 128,#128,#256, # DEFAULT: 128 max(ncore)=lat/4
-        'lat_max': 64,#64,#128, # DEFAULT: 64
-        'num_fourier': 42,#42,#85, # DEFAULT: 42
-        'num_spherical': 43,#43,#86, # DEFAULT: 43
+        'lon_max': 64,#128,#256, # DEFAULT: 128 max(ncore)=lat/4
+        'lat_max': 32,#64,#128, # DEFAULT: 64
+        'num_fourier': 21,#42,#85, # DEFAULT: 42
+        'num_spherical': 22,#43,#86, # DEFAULT: 43
         
         ### NOTE (Mistake!): the 'input' levels I use are a little different from Tan et al.  
         ### To get levels similar to Tan et al., CHANGE 'input' to 'hybrid' (vert_coord_option) and it will use these:
         'surf_res': 0.05, # DEFAULT: 0.1 
         'exponent': 3., # DEFAULT: 2.5 
-        'scale_heights': 5., # DEFAULT: 4.
+        'scale_heights': 10., # DEFAULT: 4.
         # which define p/p0 = exp[-scale_heights*(surf_res*x + (1-surf_res)*x^exponent)] with x evenly spaced on unit interval
         # the levels obtained with these parameters are essentially identical to Tan's... REMEMBER TO CHANGE sponge_pbottom also!
         
@@ -337,8 +368,8 @@ exp.namelist = namelist = Namelist({
 
 if __name__ == "__main__":
     # Define parameter values
-    Ab_list = [0.0,0.6]
-    pressures_bar = [0.1,1,3,5,10]   # in bar
+    F_list = [0.1,0.1]
+    pressures_bar = [1]   # in bar
     lw_optical_depths = {0.1:1.38,1:13.8 ,3:41.4,5:69,10:138}  # mapping Ps -> tau
     sw_optical_depths = {0.1:0.215, 1:2.15, 3:6.45, 5:10.75, 10:21.5}
     M = 18.0153
@@ -346,12 +377,11 @@ if __name__ == "__main__":
     Cp = 2842 
     gamma = Rd / Cp
     for Ps in pressures_bar:
-        for Ab in Ab_list:
+        for F in F_list:
             od_lw = lw_optical_depths[Ps]   # get optical depth for given Ps
             od_sw = sw_optical_depths[Ps]
-            run_exp = exp.derive(
-                f"TOI_561b/Sw_exp10/H2O/Cloud1/T42/TOI_561b_H2O_atm_lw_{od_lw}_sw_{od_sw}_{Ps}_bar_albedo_{Ab}"
-            )
+            f = F  
+            run_exp = exp.derive(f"TOI_561b/Grey_clouds10/TOI_561b_H2O_atm_lw_{od_lw}_sw_{od_sw}_{Ps}_bar_f_{f}_thick_clouds")
 
             # Convert bar to Pa
             Ps_Pa = Ps * 1e5
@@ -368,11 +398,9 @@ if __name__ == "__main__":
             run_exp.namelist['diffusivity_nml']['tj_bl_pres'] = 85000. * Ps
             run_exp.namelist['diffusivity_nml']['tj_strato_pres'] = 10000. / 2. * Ps
             run_exp.namelist['damping_driver_nml']['sponge_pbottom'] = 260. * Ps
-            run_exp.namelist['two_stream_gray_rad_nml']['cloud_albedo'] = Ab
+            run_exp.namelist['two_stream_gray_rad_nml']['cld_f_cond'] = f
 
-            overwrite = False
-
-            # Run the experiment
-            #run_exp.run(1, use_restart=False, num_cores=NCORES, overwrite_data=overwrite)
-            for i in range(50, 81):
+            overwrite=False
+            run_exp.run(1, use_restart=False, num_cores=NCORES, overwrite_data=overwrite)
+            for i in range(2,51):
                 run_exp.run(i, num_cores=NCORES, overwrite_data=overwrite)
