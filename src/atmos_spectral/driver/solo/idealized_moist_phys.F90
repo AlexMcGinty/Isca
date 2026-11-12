@@ -20,6 +20,8 @@ use           vert_diff_mod, only: vert_diff_init, gcm_vert_diff_down, gcm_vert_
 
 use two_stream_gray_rad_mod, only: two_stream_gray_rad_init, two_stream_gray_rad_down, two_stream_gray_rad_up, two_stream_gray_rad_end
 
+use two_stream_scatter_rad_mod, only: two_stream_scatter_rad_init, two_stream_scatter_rad, two_stream_scatter_rad_end
+
 use        cloud_simple_mod, only: cloud_simple_init, cloud_simple_end, cloud_simple
 
 use       cloud_spookie_mod, only: cloud_spookie_init, cloud_spookie
@@ -127,6 +129,7 @@ logical :: do_cloud_spookie = .false. ! SPOOKIE protocol cloud scheme
 
 ! Radiation options
 logical :: two_stream_gray = .true.
+logical :: two_stream_scatter = .false. ! two-stream grey RT with scattering (two_stream_scatter_rad)
 logical :: do_rrtm_radiation = .false.
 logical :: do_socrates_radiation = .false.
 
@@ -163,7 +166,7 @@ real :: alpha = 1.0
 
 namelist / idealized_moist_phys_nml / turb, lwet_convection, do_bm, do_ras, do_dryadj, roughness_heat,  &
                                       do_cloud_simple, do_cloud_spookie,             &
-                                      two_stream_gray, do_rrtm_radiation, do_damping,&
+                                      two_stream_gray, two_stream_scatter, do_rrtm_radiation, do_damping,&
                                       mixed_layer_bc, do_simple,                     &
                                       roughness_moist, roughness_mom, do_virtual, do_tj_bl,   &
                                       land_option, land_file_name, land_field_name,  & ! options for idealised land
@@ -388,6 +391,9 @@ end if
 ! need to make sure that gray radiation and rrtm radiation are not both called.
 if(two_stream_gray .and. do_rrtm_radiation) &
    call error_mesg('physics_driver_init','do_grey_radiation and do_rrtm_radiation cannot both be .true.',FATAL)
+
+if(two_stream_scatter .and. (two_stream_gray .or. do_rrtm_radiation .or. do_socrates_radiation)) &
+   call error_mesg('idealized_moist_phys','two_stream_scatter cannot be used with another radiation scheme (set two_stream_gray = .false.).',FATAL)
 
 if(two_stream_gray .and. (do_cloud_simple .or. do_cloud_spookie)) &
    call error_mesg('idealized_moist_phys','Gray radiation is not configured to run with the cloud scheme at present.',FATAL)
@@ -811,6 +817,7 @@ end select
 !endif
 
 if(two_stream_gray) call two_stream_gray_rad_init(is, ie, js, je, num_levels, get_axis_id(), Time, rad_lonb_2d, rad_latb_2d, dt_real)
+if(two_stream_scatter) call two_stream_scatter_rad_init(is, ie, js, je, num_levels, get_axis_id(), Time, rad_lonb_2d, rad_latb_2d, dt_real)
 
 #ifdef RRTM_NO_COMPILE
     if (do_rrtm_radiation) then
@@ -1219,6 +1226,25 @@ if(two_stream_gray) then
                      dt_tg(:,:,:), albedo)
 end if
 
+! Two-stream scattering scheme: single call (up and down fluxes together).
+! Placed where two_stream_gray_rad_up is called: t_surf is the same as at the
+! start of the step (mixed_layer updates it later), and net_surf_sw_down /
+! surf_lw_down are first used by mixed_layer below.
+if(two_stream_scatter) then
+   call two_stream_scatter_rad(is, js, ie, je, Time, &
+                     rad_lat(:,:),           &
+                     rad_lon(:,:),           &
+                     p_half(:,:,:,current),  &
+                     p_full(:,:,:,current),  &
+                     t_surf(:,:),            &
+                     tg(:,:,:,previous),     &
+                     dt_tg(:,:,:),           &
+                     net_surf_sw_down(:,:),  &
+                     surf_lw_down(:,:),      &
+                     albedo,                 &
+                     grid_tracers(:,:,:,previous,nsphum))
+end if
+
 #ifdef RRTM_NO_COMPILE
     if (do_rrtm_radiation) then
         call error_mesg('idealized_moist_phys','do_rrtm_radiation is .true. but compiler flag -D RRTM_NO_COMPILE used. Stopping.', FATAL)
@@ -1460,6 +1486,7 @@ subroutine idealized_moist_phys_end
 
 deallocate (dt_bucket, filt)
 if(two_stream_gray)      call two_stream_gray_rad_end
+if(two_stream_scatter)   call two_stream_scatter_rad_end
 if(lwet_convection)      call qe_moist_convection_end
 if(do_ras)               call ras_end
 if(do_dryadj)            call dry_adj_end
